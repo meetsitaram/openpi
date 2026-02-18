@@ -127,13 +127,25 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
-    """Create a dataset for training."""
+_BEHAVIOR_DATA_ROOT = "/home/stickbot/projects/behavior/behavior_data"
+
+
+def create_behavior_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+) -> Dataset:
+    """Create a dataset for training.
+
+    Args:
+        data_config: Data configuration.
+        action_horizon: Number of future action steps.
+    """
     from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
     
+    root = data_config.behavior_dataset_root or _BEHAVIOR_DATA_ROOT
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
-        root=data_config.behavior_dataset_root,
+        root=root,
         tasks=["turning_on_radio"],
         modalities=["rgb"],
         local_only=True,
@@ -144,6 +156,97 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         chunk_streaming_using_keyframe=True,
         shuffle=True,
     )
+
+    # Curriculum training: filter to specific skill phases
+    skill_indices = None
+    if data_config.curriculum_skill_indices is not None:
+        skill_indices = set(data_config.curriculum_skill_indices)
+    elif data_config.nav_only:
+        skill_indices = {0}  # backward compat
+
+    if skill_indices is not None:
+        from openpi.policies.b1k_phase_transforms import get_skill_frame_ranges
+        skill_ranges = get_skill_frame_ranges(root, task_id=0, skill_indices=skill_indices)
+        if skill_ranges:
+            original_chunks = dataset.chunks
+            filtered_chunks = []
+            # Map episode indices to their global frame offsets
+            ep_offsets = {}
+            offset = 0
+            for ep_idx in dataset.episodes:
+                ep_len = dataset.meta.episodes[ep_idx]["length"]
+                ep_offsets[ep_idx] = offset
+                offset += ep_len
+
+            for ep_idx, segments in skill_ranges.items():
+                if ep_idx not in ep_offsets:
+                    continue
+                global_offset = ep_offsets[ep_idx]
+                for seg_start, seg_end in segments:
+                    # Create chunks within each segment (250-frame GOP chunks)
+                    chunk_size = 250
+                    for local_start in range(seg_start, seg_end, chunk_size):
+                        local_end = min(local_start + chunk_size, seg_end)
+                        filtered_chunks.append((
+                            global_offset + local_start,
+                            global_offset + local_end,
+                            local_start,
+                        ))
+
+            dataset.chunks = filtered_chunks
+            total_filtered = sum(e - s for s, e, _ in filtered_chunks)
+            total_orig = sum(e - s for s, e, _ in original_chunks)
+            logging.info(
+                "Curriculum filtering (skills %s): %d chunks, %d frames "
+                "(was %d frames, %.0f%% reduction)",
+                skill_indices, len(filtered_chunks), total_filtered,
+                total_orig, (1 - total_filtered / total_orig) * 100,
+            )
+        else:
+            logging.warning("No skill ranges found for %s — using full dataset", skill_indices)
+
+    # Grasp-focused curriculum: filter to window around right-gripper close
+    if data_config.grasp_frame_window is not None:
+        before_close, after_close = data_config.grasp_frame_window
+        from openpi.policies.b1k_phase_transforms import get_grasp_frame_ranges
+        grasp_ranges = get_grasp_frame_ranges(
+            root, task_id=0, before_close=before_close, after_close=after_close,
+        )
+        if grasp_ranges:
+            original_chunks = dataset.chunks
+            filtered_chunks = []
+            ep_offsets = {}
+            offset = 0
+            for ep_idx in dataset.episodes:
+                ep_len = dataset.meta.episodes[ep_idx]["length"]
+                ep_offsets[ep_idx] = offset
+                offset += ep_len
+
+            for ep_idx, segments in grasp_ranges.items():
+                if ep_idx not in ep_offsets:
+                    continue
+                global_offset = ep_offsets[ep_idx]
+                for seg_start, seg_end in segments:
+                    chunk_size = 250
+                    for local_start in range(seg_start, seg_end, chunk_size):
+                        local_end = min(local_start + chunk_size, seg_end)
+                        filtered_chunks.append((
+                            global_offset + local_start,
+                            global_offset + local_end,
+                            local_start,
+                        ))
+
+            dataset.chunks = filtered_chunks
+            total_filtered = sum(e - s for s, e, _ in filtered_chunks)
+            total_orig = sum(e - s for s, e, _ in original_chunks)
+            logging.info(
+                "Grasp-window filtering (%d before, %d after R_close): %d chunks, %d frames "
+                "(was %d frames, %.0f%% reduction)",
+                before_close, after_close, len(filtered_chunks), total_filtered,
+                total_orig, (1 - total_filtered / total_orig) * 100,
+            )
+        else:
+            logging.warning("No grasp windows found — using full dataset")
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.meta.tasks)])
@@ -278,6 +381,19 @@ def create_data_loader(
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
+
+    # Use local BehaviorLeRobotDataset when behavior_dataset_root is set
+    # (avoids downloading the full multi-TB HuggingFace dataset)
+    if data_config.behavior_dataset_root is not None:
+        logging.info("Using local BehaviorLeRobotDataset (behavior_dataset_root is set)")
+        return create_behavior_data_loader(
+            config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+        )
+
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
@@ -302,7 +418,10 @@ def create_behavior_data_loader(
     skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     data_config = config.data.create(config.assets_dirs, config.model)
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+    dataset = create_behavior_dataset(
+        data_config,
+        action_horizon=config.model.action_horizon,
+    )
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

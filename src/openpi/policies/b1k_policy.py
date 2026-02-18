@@ -96,6 +96,16 @@ class B1kInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Pass through skill/phase fields for phase-conditioned transforms
+        for key in ("skill_phase", "skill_description", "skill_type", "skill_objects"):
+            if key in data:
+                inputs[key] = data[key]
+
+        # Pass through privileged sim data for grounding auxiliary head
+        for key in ("observation/task_info", "observation/cam_rel_poses"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 

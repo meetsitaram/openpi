@@ -55,6 +55,24 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class CheckpointWithAuxHeadWeightLoader(WeightLoader):
+    """Loads weights from a checkpoint, allowing new auxiliary head params to be randomly initialized.
+
+    Like CheckpointWeightLoader but the missing_regex also matches aux head parameters
+    (aux_skill_type_head/*, aux_phase_index_head/*) in addition to LoRA weights.
+    This allows loading a base checkpoint that was trained without auxiliary heads
+    into a model that has them.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        # Allow missing LoRA weights AND auxiliary head weights to be randomly initialized.
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*aux_.*")
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 

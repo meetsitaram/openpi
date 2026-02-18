@@ -94,6 +94,18 @@ class DataConfig:
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
 
+    # If true, filter to navigation-only frames (curriculum training Stage 1).
+    nav_only: bool = False
+
+    # Curriculum training: set of skill_idx values to include (e.g. {0} for nav,
+    # {0, 1} for nav + pick-up). If None, use all frames. Overrides nav_only.
+    curriculum_skill_indices: tuple[int, ...] | None = None
+
+    # Grasp-focused curriculum: filter frames to a window around the right-gripper
+    # close event. Tuple of (before_close, after_close) frames, or None to disable.
+    # E.g. (300, 100) = 300 frames before R_close to 100 frames after.
+    grasp_frame_window: tuple[int, int] | None = None
+
     # Only used for B1K data loader.
     behavior_dataset_root: str | None = None
 
@@ -403,6 +415,220 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             use_quantile_norm=True,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotB1KPhaseDataConfig(DataConfigFactory):
+    """Phase-conditioned B1K data config.
+
+    Uses skill annotations to inject phase info into prompts, camera masks,
+    proprioception, and action loss weights.
+    """
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # Low weight for de-emphasized action dims during phase-aware training
+    action_low_weight: float = 0.1
+    # Per-component navigation weights (passed to PhaseAwareActionWeighting)
+    base_nav_weight: float = 2.0
+    torso_nav_weight: float = 0.3
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.policies.b1k_phase_transforms import (
+            InjectSkillAnnotation,
+            PhaseConditionedPrompt,
+            PhaseAwareCameraMasking,
+            PhaseAwareProprioception,
+            PhaseAwareActionWeighting,
+            EncodePhaseLabels,
+            ComputeGroundingLabels,
+            CleanupSkillFields,
+        )
+
+        dataset_root = self.base_config.behavior_dataset_root if self.base_config else None
+        if dataset_root is None:
+            raise ValueError("behavior_dataset_root must be set for phase-conditioned training")
+
+        # Phase 1: InjectSkillAnnotation runs before repack to access raw fields.
+        # We use a custom repack that preserves skill fields alongside standard obs.
+        repack_transform = _transforms.Group(
+            inputs=[
+                # First: inject skill annotations using raw episode_index/task_index/timestamp
+                InjectSkillAnnotation(dataset_root=dataset_root),
+                # Then: repack standard obs fields + carry through skill fields
+                _transforms.RepackTransform(
+                    {
+                        "observation/egocentric_camera": "observation.images.rgb.head",
+                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        # Carry through skill fields
+                        "skill_phase": "skill_phase",
+                        "skill_description": "skill_description",
+                        "skill_type": "skill_type",
+                        "skill_objects": "skill_objects",
+                        # Privileged sim data for grounding auxiliary
+                        "observation/task_info": "observation.task_info",
+                        "observation/cam_rel_poses": "observation.cam_rel_poses",
+                    }
+                ),
+            ]
+        )
+
+        # Phase 2: Data transforms — B1kInputs + phase-aware modifications
+        data_transforms = _transforms.Group(
+            inputs=[
+                # Phase-conditioned prompt (before B1kInputs, needs "prompt" key)
+                PhaseConditionedPrompt(),
+                # Standard B1K input processing
+                b1k_policy.B1kInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                ),
+                # Phase-aware camera masking (after B1kInputs creates image_mask)
+                PhaseAwareCameraMasking(),
+                # Phase-aware proprioception (after B1kInputs creates state)
+                PhaseAwareProprioception(),
+                # Phase-aware action weighting with per-component nav weights
+                PhaseAwareActionWeighting(
+                    low_weight=self.action_low_weight,
+                    base_nav_weight=self.base_nav_weight,
+                    torso_nav_weight=self.torso_nav_weight,
+                ),
+                # Encode phase labels as integer arrays for auxiliary head training
+                EncodePhaseLabels(),
+                # Compute grounding labels from privileged 3D positions
+                ComputeGroundingLabels(),
+                # Remove skill string fields + consumed privileged data
+                CleanupSkillFields(),
+            ],
+            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotB1KCurriculumDataConfig(DataConfigFactory):
+    """Curriculum B1K data config — filters dataset to specific skill phases.
+
+    Uses skill annotations to restrict training to selected phases.
+    Supports per-component action weighting for navigation.
+
+    Skill indices for turning_on_radio:
+        0 = move to (navigation)
+        1 = pick up from (uncoordinated)
+        2 = press (coordinated)
+        3 = place on (uncoordinated)
+    """
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # Skill indices to include (tuple for frozen dataclass compatibility)
+    skill_indices: tuple[int, ...] = (0,)
+
+    # Action weights
+    action_low_weight: float = 0.1       # arms/grippers during nav
+    base_nav_weight: float = 2.0         # boost base velocity during nav
+    torso_nav_weight: float = 0.3        # dampen torso during nav
+
+    # Early transition: relabel last N frames of each phase as the NEXT phase.
+    # At 30fps: 30 = 1 sec, 60 = 2 sec. Teaches the model to anticipate
+    # transitions (e.g., start "pick up" behavior while finishing approach).
+    early_transition_frames: int = 0
+
+    # Grasp-focused filtering: (before_close, after_close) frames around R_close.
+    # None = disabled (use skill_indices filtering only).
+    grasp_window: tuple[int, int] | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.policies.b1k_phase_transforms import (
+            InjectSkillAnnotation,
+            PhaseConditionedPrompt,
+            PhaseAwareCameraMasking,
+            PhaseAwareProprioception,
+            PhaseAwareActionWeighting,
+            EncodePhaseLabels,
+            ComputeGroundingLabels,
+            CleanupSkillFields,
+        )
+
+        dataset_root = self.base_config.behavior_dataset_root if self.base_config else None
+        if dataset_root is None:
+            raise ValueError("behavior_dataset_root must be set for curriculum training")
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                InjectSkillAnnotation(
+                    dataset_root=dataset_root,
+                    early_transition_frames=self.early_transition_frames,
+                ),
+                _transforms.RepackTransform(
+                    {
+                        "observation/egocentric_camera": "observation.images.rgb.head",
+                        "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+                        "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                        "skill_phase": "skill_phase",
+                        "skill_description": "skill_description",
+                        "skill_type": "skill_type",
+                        "skill_objects": "skill_objects",
+                        # Privileged sim data for grounding auxiliary
+                        "observation/task_info": "observation.task_info",
+                        "observation/cam_rel_poses": "observation.cam_rel_poses",
+                    }
+                ),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                PhaseConditionedPrompt(),
+                b1k_policy.B1kInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                ),
+                PhaseAwareCameraMasking(),
+                PhaseAwareProprioception(),
+                PhaseAwareActionWeighting(
+                    low_weight=self.action_low_weight,
+                    base_nav_weight=self.base_nav_weight,
+                    torso_nav_weight=self.torso_nav_weight,
+                ),
+                EncodePhaseLabels(),
+                ComputeGroundingLabels(),
+                CleanupSkillFields(),
+            ],
+            outputs=[b1k_policy.B1kOutputs(action_dim=23)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
+            curriculum_skill_indices=self.skill_indices,
+            grasp_frame_window=self.grasp_window,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
@@ -702,7 +928,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(190)),
-                behavior_dataset_root="/vision/group/behavior/2025-challenge-demos",
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -729,7 +955,7 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes_index=list(range(190)),
-                behavior_dataset_root="/vision/group/behavior/2025-challenge-demos",
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -745,7 +971,211 @@ _CONFIGS = [
         checkpoint_base_dir="./outputs/checkpoints",
         num_workers=1,
     ),
-    
+
+    # Phase-conditioned pi0.5 for B1K
+    # Uses skill annotations to inject phase-aware prompts, camera masking,
+    # proprioception selection, and action loss weighting.
+    # Auxiliary heads predict skill_type (3 classes) and phase_index (4 classes)
+    # from PaliGemma VLM features to encourage phase-discriminative representations.
+    TrainConfig(
+        name="pi05_b1k_phase",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,   # navigation, uncoordinated, coordinated
+                num_phase_index_classes=4,  # move_to, pick_up, press, place_on
+                hidden_dim=256,
+                skill_type_loss_weight=0.1,
+                phase_index_loss_weight=0.05,
+            ),
+        ),
+        data=LeRobotB1KPhaseDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
+            ),
+        ),
+        # Use aux-head-aware loader: randomly initializes aux head params not in base checkpoint.
+        weight_loader=weight_loaders.CheckpointWithAuxHeadWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=5000,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=1,
+    ),
+
+    # ─── Grounding-enabled phase config (for serving grounding_v1 checkpoints) ───
+    TrainConfig(
+        name="pi05_b1k_phase_grounding",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+                hidden_dim=256,
+                skill_type_loss_weight=0.1,
+                phase_index_loss_weight=0.05,
+                grounding_enabled=True,
+                grounding_loss_weight=0.05,
+                grounding_num_objects=2,
+                grounding_hidden_dim=512,
+            ),
+        ),
+        data=LeRobotB1KPhaseDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWithAuxHeadWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=15_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+                grounding_enabled=True,
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=1,
+    ),
+
+    # ─── Curriculum Training: Stage 1 — Navigation Only ───
+    # Filters dataset to navigation frames only. Boosts base velocity action
+    # weight (2x) and dampens torso (0.3x) to teach proper wheeled movement.
+    # Train for 15k steps, then use the checkpoint as starting point for Stage 2.
+    TrainConfig(
+        name="pi05_b1k_nav_curriculum",
+        exp_name="pi05_nav_stage1_v2",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+                hidden_dim=256,
+                skill_type_loss_weight=0.1,
+                phase_index_loss_weight=0.05,
+            ),
+        ),
+        data=LeRobotB1KCurriculumDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            skill_indices=(0,),  # Navigation only
+            # Reuse existing norm stats from previous training runs
+            assets=AssetsConfig(
+                assets_dir="./outputs/assets/pi05_b1k_phase",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWithAuxHeadWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=15_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=1,
+    ),
+
+    # ─── Curriculum Training: Stage 2 — Navigation + Pick Up ───
+    # Resumes from Stage 1 (navigation) checkpoint. Trains on nav + pick-up
+    # frames so the model learns the transition and manipulation while retaining
+    # navigation skills.
+    TrainConfig(
+        name="pi05_b1k_nav_pickup",
+        exp_name="pi05_nav_pickup_v2",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+                hidden_dim=256,
+                skill_type_loss_weight=0.1,
+                phase_index_loss_weight=0.05,
+            ),
+        ),
+        data=LeRobotB1KCurriculumDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            skill_indices=(0, 1),  # Navigation + Pick up from
+            action_low_weight=0.1,
+            base_nav_weight=2.0,
+            torso_nav_weight=0.3,
+            # Reuse existing norm stats
+            assets=AssetsConfig(
+                assets_dir="./outputs/assets/pi05_b1k_phase",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/home/stickbot/projects/behavior/behavior_data",
+            ),
+        ),
+        # Load from Stage 1 nav checkpoint (v2 = anti-cheat aux heads)
+        weight_loader=weight_loaders.CheckpointWithAuxHeadWeightLoader(
+            "./outputs/checkpoints/pi05_b1k_nav_curriculum/pi05_nav_stage1_v2/14999/params"
+        ),
+        num_train_steps=20_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora",
+            aux_head=pi0_config.AuxHeadConfig(
+                num_skill_type_classes=3,
+                num_phase_index_classes=4,
+            ),
+        ).get_freeze_filter(),
+        ema_decay=None,
+        val_log_interval=5000,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=1,
+    ),
+
     #
     # Fine-tuning Libero configs.
     #

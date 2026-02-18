@@ -147,15 +147,30 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        result = model.compute_loss(rng, observation, actions, train=True)
+
+        # Handle both plain array (backward compat) and dict (aux head) returns.
+        if isinstance(result, dict):
+            action_loss = jnp.mean(result["action_loss"])
+            # Sum all weighted auxiliary losses (keys ending in "_loss" except "action_loss").
+            aux_total = jnp.float32(0.0)
+            for k, v in result.items():
+                if k.endswith("_loss") and k != "action_loss":
+                    aux_total = aux_total + v
+            total_loss = action_loss + aux_total
+            # Return total loss as scalar, plus extra metrics for logging.
+            return total_loss, result
+        else:
+            return jnp.mean(result), None
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux_result), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +203,14 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # Add auxiliary head metrics when available.
+    if aux_result is not None:
+        info["action_loss"] = jnp.mean(aux_result["action_loss"])
+        for k, v in aux_result.items():
+            if k != "action_loss":  # aux losses and accuracies
+                info[k] = v
+
     return new_state, info
 
 

@@ -63,6 +63,11 @@ class Policy(BasePolicy):
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+            # JIT-compile predict_phase if the model has it (aux heads)
+            if hasattr(model, "predict_phase"):
+                self._predict_phase = nnx_utils.module_jit(model.predict_phase)
+            else:
+                self._predict_phase = None
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -104,6 +109,36 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def predict_phase(self, obs: dict) -> dict:
+        """Run auxiliary heads to predict phase/skill type from observations.
+
+        Applies the same input transforms as `infer`, then calls the model's
+        `predict_phase` method (which runs embed_prefix + aux head MLPs).
+        The forward pass is JIT-compiled for performance (~10% of a full inference).
+
+        Returns:
+            Dict with "skill_type" (int), "phase_index" (int), and their logits.
+            Empty dict if the model doesn't have aux heads.
+        """
+        if getattr(self, "_predict_phase", None) is None:
+            return {}
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        if not self._is_pytorch_model:
+            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        else:
+            return {}  # PyTorch predict_phase not implemented
+
+        observation = _model.Observation.from_dict(inputs)
+        results = self._predict_phase(observation)
+
+        # Convert to numpy scalars for the wrapper
+        return jax.tree.map(
+            lambda x: np.asarray(x[0, ...]) if hasattr(x, 'shape') and x.ndim > 0 else np.asarray(x),
+            results,
+        )
 
     @property
     def metadata(self) -> dict[str, Any]:

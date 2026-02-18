@@ -16,6 +16,38 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass(frozen=True)
+class AuxHeadConfig:
+    """Configuration for auxiliary prediction heads."""
+
+    # Number of skill-type classes (0 = disabled). e.g. 3 for navigation/uncoordinated/coordinated.
+    num_skill_type_classes: int = 0
+    # Number of phase-index classes (0 = disabled). e.g. 4 for move_to/pick_up/press/place_on.
+    num_phase_index_classes: int = 0
+    # Hidden dimension of the 2-layer MLP bottleneck.
+    hidden_dim: int = 256
+    # Loss weight for skill-type classification.
+    skill_type_loss_weight: float = 0.1
+    # Loss weight for phase-index classification.
+    phase_index_loss_weight: float = 0.05
+
+    # --- Visual grounding auxiliary ---
+    # Enable grounding head that predicts object 2D positions from SigLIP tokens.
+    grounding_enabled: bool = False
+    # Number of objects to predict positions for (radio + table = 2).
+    grounding_num_objects: int = 2
+    # Hidden dimension for grounding MLP.
+    grounding_hidden_dim: int = 512
+    # Loss weight for grounding regression (SmoothL1).
+    grounding_loss_weight: float = 0.05
+
+    @property
+    def enabled(self) -> bool:
+        return (self.num_skill_type_classes > 0
+                or self.num_phase_index_classes > 0
+                or self.grounding_enabled)
+
+
+@dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
@@ -31,6 +63,10 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+
+    # Auxiliary prediction head configuration. When enabled, an MLP head is
+    # attached to the PaliGemma prefix output to predict phase/skill labels.
+    aux_head: AuxHeadConfig = dataclasses.field(default_factory=AuxHeadConfig)
 
     def __post_init__(self):
         if self.max_token_len is None:
