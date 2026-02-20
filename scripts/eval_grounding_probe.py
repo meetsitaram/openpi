@@ -278,11 +278,8 @@ def draw_predictions(frame, preds, vis_probs, gt, head_w, head_h,
             cv2.putText(out, label, (x1, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, pred_col, 2)
         else:
-            # Dim marker for low-confidence predictions
-            cv2.circle(out, (cx_px, cy_px), 3, pred_col, 1)
-            cv2.putText(out, f"{name.upper()} {vis_p:.0%}",
-                        (cx_px + 6, cy_px + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, pred_col, 1)
+            # Object predicted as not present -- don't draw anything
+            pass
 
         # GT crosshair (only when GT is available and visible)
         gt_info = gt[name]

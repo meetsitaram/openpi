@@ -497,6 +497,14 @@ class Pi0(_model.BaseModel):
             results["phase_index_logits"] = logits
             results["phase_index"] = jnp.argmax(logits, axis=-1)
 
+        if self.aux_grounding_head is not None and prefix_tokens is not None:
+            num_head_tokens = 256
+            head_cam_tokens = prefix_tokens[:, :num_head_tokens, :]
+            bbox_pred, vis_logits = self.aux_grounding_head(head_cam_tokens)
+            vis_probs = jax.nn.sigmoid(vis_logits)
+            results["grounding_bbox"] = bbox_pred       # [b, num_obj*4]
+            results["grounding_vis"] = vis_probs         # [b, num_obj]
+
         return results
 
     @override

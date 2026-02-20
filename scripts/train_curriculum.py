@@ -8,11 +8,12 @@ Usage:
     source .venv/bin/activate
     uv run scripts/train_curriculum.py [--run_name my_run] [--start_stage 0]
 
-Stages:
-    0: Navigation only         (skill_indices={0})       — 15k steps
-    1: Navigation + Pick up    (skill_indices={0, 1})    — 20k steps
-    2: + Press                 (skill_indices={0, 1, 2}) — 20k steps  [future]
-    3: Full task               (skill_indices={0,1,2,3}) — 20k steps  [future]
+Stages (v4 — 2-stage curriculum):
+    0: Navigation only         (skill_indices={0})           — 15k steps
+       Grounding head trains alongside the policy to learn object detection.
+    1: Full task               (skill_indices={0,1,2,3})     — 20k steps
+       All video frames including navigation. Grounding head is FROZEN to
+       preserve object detection learned in stage 0.
 """
 
 import argparse
@@ -30,30 +31,17 @@ CURRICULUM_STAGES = [
         "name": "stage0_nav",
         "skill_indices": (0,),
         "num_train_steps": 15_000,
-        "early_transition_frames": 0,  # no early transition for nav-only
-        "description": "Navigation only (move to)",
+        "early_transition_frames": 0,
+        "freeze_grounding": False,
+        "description": "Navigation only — grounding head trains",
     },
     {
-        "name": "stage1_nav_pickup",
-        "skill_indices": (0, 1),
-        "num_train_steps": 15_000,
-        "early_transition_frames": 60,  # 2 sec at 30fps: last 2s of nav → labeled as pickup
-        "description": "Navigation + Pick up from",
-    },
-    {
-        "name": "stage2_full_task",
-        "skill_indices": (0, 1, 2, 3),
-        "num_train_steps": 20_000,
-        "early_transition_frames": 60,  # 2 sec at 30fps
-        "description": "Full task (all 4 phases, base unlocked during manipulation)",
-    },
-    {
-        "name": "stage3_grasp",
+        "name": "stage1_full",
         "skill_indices": (0, 1, 2, 3),
         "num_train_steps": 20_000,
         "early_transition_frames": 60,
-        "grasp_window": (300, 100),  # 300 frames before R_close → 100 after
-        "description": "Grasp-focused (300fr before → 100fr after R_close, 18.6% of data)",
+        "freeze_grounding": True,
+        "description": "Full task (all phases incl. nav) — grounding head frozen",
     },
 ]
 
@@ -116,6 +104,7 @@ def build_stage_config(
     else:
         loader = weight_loaders.CheckpointWithAuxHeadWeightLoader(base_checkpoint)
 
+    freeze_grounding = stage.get("freeze_grounding", False)
     freeze_filter_config = pi0_config.Pi0Config(
         pi05=True,
         action_horizon=50,
@@ -124,6 +113,7 @@ def build_stage_config(
             num_skill_type_classes=3,
             num_phase_index_classes=4,
             grounding_enabled=True,
+            grounding_freeze=freeze_grounding,
         ),
     )
 

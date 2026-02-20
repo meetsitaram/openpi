@@ -172,6 +172,62 @@ Since `task_info` doesn't include AABB extents, we hardcode approximate 3D half-
 
 These can be refined by querying `obj.aabb_extent` in the simulator once and recording the values.
 
+## Inference-Time Grounding (v3 addition)
+
+### Problem: auxiliary head is training-only
+
+The grounding head was originally **only** used during training as an auxiliary loss to shape SigLIP features. During inference (`sample_actions`), the grounding head was never called -- the policy had no explicit awareness of object visibility or location. The improved spatial features were supposed to help implicitly, but in practice:
+
+1. **Action policy degraded** after retraining with the new grounding loss. The modified SigLIP features confused the action head, which had to simultaneously adapt to the changed feature space.
+2. **Ghost signals**: Even when visibility is low (e.g. radio 5%), SigLIP tokens still carry a faint "radio location" signal from the grounding gradient. The action head can't distinguish high-confidence from low-confidence detections because it never sees the visibility probability.
+
+### Solution: wire grounding predictions to inference
+
+Added grounding head inference to the `predict_phase()` method in `pi0.py`. This runs during serving (already called every step by the eval wrapper) at minimal cost since the prefix pass is already computed for the phase/skill heads.
+
+**`pi0.py` changes:**
+- `predict_phase()` now also returns `grounding_bbox` `[num_obj*4]` and `grounding_vis` `[num_obj]` (sigmoid probabilities)
+- Uses **pre-LLM** head camera tokens (first 256), consistent with training
+
+**`eval_b1k_wrapper.py` changes:**
+- `_grounding_log_dict()`: extracts per-object visibility + bbox from aux predictions
+- Logging now shows: `radio=87%@(0.45,0.62) table=100%@(0.50,0.55)` each log interval
+- Phase history JSON includes grounding data per step (`radio_vis`, `radio_cx`, etc.)
+
+**No changes needed** in `policy.py` (already passes through all dict keys) or `serve_b1k.py`.
+
+### Future: use grounding to influence behavior
+
+The grounding predictions are now **visible** at inference time but not yet **used** to influence actions. Potential next steps:
+
+- **Phase detector**: use radio visibility > threshold as a confirmation signal for nav→manip transition (e.g., only switch to manipulation when the model is confident the radio is in view)
+- **Navigation correction**: if radio is detected at (cx, cy) far from center, inject a base rotation correction to center the robot on the target
+- **Inject into action head**: concatenate (bbox, vis) into the state vector so the denoising head can explicitly condition on object location -- requires retraining but makes the signal fully differentiable
+
+## Curriculum Stage Order (v3)
+
+Stages were reordered so grasp-focused training happens **before** full-task training:
+
+| Stage | Name | Skills | Steps | Data |
+|-------|------|--------|-------|------|
+| 0 | `stage0_nav` | {0} | 15k | Navigation only |
+| 1 | `stage1_nav_pickup` | {0,1} | 15k | Nav + pickup |
+| 2 | `stage2_grasp` | {0,1,2,3} | 20k | 300fr before → 100fr after R_close |
+| 3 | `stage3_full_task` | {0,1,2,3} | 20k | All data, all phases |
+
+Rationale: teach grasping intensively first, then generalize back to the full distribution.
+
+## Grounding v3 Results
+
+**Trained checkpoint**: `curriculum_stage3_full_task/grounding_v3_spatial_stage3_full_task/19999`
+
+**Grounding quality** (from probe overlay on eval video):
+- Head camera detections are accurate when objects are visible (RADIO 100%, TABLE 100% with correct bbox placement)
+- Visibility prediction works: correctly shows low confidence (5-10%) when objects are not in view
+- Wrist camera predictions are unreliable (grounding head only trained on head camera tokens)
+
+**Action policy**: Degraded -- robot lost navigation ability. Root cause: SigLIP feature space changed due to grounding gradients, action head couldn't fully adapt during 70k steps.
+
 ## Implementation Todos
 
 1. [DONE] Update `ComputeGroundingLabels` in `b1k_phase_transforms.py`: add `_project_bbox_to_normalized()`, produce `grounding_xywh` (8,) GT
@@ -179,4 +235,7 @@ These can be refined by querying `obj.aabb_extent` in the simulator once and rec
 3. [DONE] Add BCE visibility loss to training, combined with SmoothL1 bbox loss
 4. [DONE] Update `aux_labels` comment in `model.py`
 5. [DONE] Update `eval_grounding_probe.py`: spatial softmax inference, visibility-gated drawing, CSV with vis_prob
-6. Retrain from Stage 2 checkpoint with new grounding head
+6. [DONE] Retrain from base with new grounding head (grounding_v3_spatial, 4-stage curriculum)
+7. [DONE] Wire grounding predictions to inference (`predict_phase` + eval wrapper logging)
+8. Use grounding visibility in phase detector for nav→manip transition
+9. Investigate action policy degradation: try more training steps, or inject grounding as explicit action head input

@@ -167,6 +167,53 @@ Output: `outputs/grounding_probe/probe_head_episode_XXXXXXXX_NNNNN.mp4`
 
 ---
 
+## 6. Eval Sweep (compare models across curriculum stages)
+
+Two-phase process: Phase 1 runs sim eval, Phase 2 generates overlays + aggregated metrics.
+
+### Phase 1: Run eval sweep (bash script)
+
+```bash
+# IMPORTANT: Do NOT have the openpi .venv activated in this terminal.
+# The script manages both openpi and env_isaaclab envs internally.
+
+cd /home/stickbot/projects/behavior/b1k-baselines/baselines/openpi
+
+# Full sweep: all 4 stages, 10 instances each, 1500 steps
+bash scripts/run_eval_sweep.sh
+
+# Single stage only:
+bash scripts/run_eval_sweep.sh --stage 3
+
+# Custom steps/instances:
+bash scripts/run_eval_sweep.sh --max_steps 800 --instances "0,1,2"
+```
+
+Output: `eval_logs/v3_sweep/<stage_name>/metrics/*.json` + `videos/*.mp4`
+
+### Phase 2: Grounding overlays + metrics aggregation
+
+```bash
+cd /home/stickbot/projects/behavior/b1k-baselines/baselines/openpi
+source .venv/bin/activate
+
+# Full run (overlays + metrics CSV + summary table):
+python scripts/aggregate_eval_sweep.py
+
+# Metrics only (skip slow overlay generation):
+python scripts/aggregate_eval_sweep.py --no-overlays
+
+# Single stage:
+python scripts/aggregate_eval_sweep.py --stage stage3_full_task
+```
+
+Output:
+- Overlay videos: `outputs/v3_sweep_overlays/<stage>/`
+- Per-instance CSV: `outputs/v3_sweep_comparison.csv`
+- Summary CSV: `outputs/v3_sweep_summary.csv`
+
+---
+
 ## Checkpoints Reference
 
 | Checkpoint | Description |
@@ -175,6 +222,10 @@ Output: `outputs/grounding_probe/probe_head_episode_XXXXXXXX_NNNNN.mp4`
 | `grounding_v1_stage1_nav_pickup/14999` | Stage 1 (nav+pickup), 15k steps |
 | `grounding_v2_full_stage2_full_task/19999` | Stage 2 (all 4 phases), 20k steps, base unlocked |
 | `grounding_v2_full_stage3_grasp/19999` | Stage 3 (grasp-focused), 20k steps, 300fr before→100fr after R_close |
+| `grounding_v3_spatial_stage0_nav/14999` | v3 Stage 0 (nav only), spatial softmax grounding |
+| `grounding_v3_spatial_stage1_nav_pickup/14999` | v3 Stage 1 (nav+pickup), spatial softmax |
+| `grounding_v3_spatial_stage2_grasp/19999` | v3 Stage 2 (grasp-focused), spatial softmax |
+| `grounding_v3_spatial_stage3_full_task/19999` | v3 Stage 3 (full task), spatial softmax |
 | `pi05_phase_v2/40000` | Phase-aware pi0.5, 40k steps, no grounding |
 | `pi0_b1k_turning_on_radio/49999_radio` | Original pi0 baseline, 50k steps |
 

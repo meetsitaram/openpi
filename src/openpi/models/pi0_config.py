@@ -39,6 +39,8 @@ class AuxHeadConfig:
     grounding_hidden_dim: int = 512
     # Loss weight for grounding regression (SmoothL1).
     grounding_loss_weight: float = 0.05
+    # Freeze the grounding head parameters (use after stage 0 to prevent drift).
+    grounding_freeze: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -113,7 +115,15 @@ class Pi0Config(_model.BaseModelConfig):
         return observation_spec, action_spec
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        """Returns the freeze filter based on the model config."""
+        """Returns the freeze filter based on the model config.
+
+        The returned filter matches parameters that should be *frozen*.
+        TrainConfig.trainable_filter inverts this via nnx.Not().
+
+        When aux_head.grounding_freeze is True, the grounding head parameters
+        are added to the freeze set (via nnx.Any) so they are preserved from
+        a previous training stage.
+        """
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
@@ -139,6 +149,12 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
-        if not filters:
-            return nnx.Nothing
-        return nnx.All(*filters)
+
+        lora_freeze = nnx.All(*filters) if filters else nnx.Nothing
+
+        # Optionally freeze the grounding head to preserve learned detections.
+        if self.aux_head.grounding_freeze:
+            grounding_freeze = nnx_utils.PathRegex(".*aux_grounding_head.*")
+            return nnx.Any(lora_freeze, grounding_freeze)
+
+        return lora_freeze

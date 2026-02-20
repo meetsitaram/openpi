@@ -37,6 +37,12 @@ _MIN_NAV_STEPS = 50             # minimum steps in navigation before action fall
 _BASE_HISTORY_WINDOW = 30       # look-back window for "was actively navigating" check
 _MAX_BASE_CORRECTION = 0.05     # clamp base actions during manipulation (~10% of nav speed)
 
+# Grounding visibility gate for phase transitions
+_RADIO_VIS_THRESHOLD = 0.50     # radio must be >= this confidence before nav→manip transition
+_RADIO_BBOX_MIN_SIZE = 0.08     # radio bbox (max of w,h) must be >= this fraction of image to transition
+_NAV_SLOWDOWN_VIS = 0.30        # start slowing down when radio visibility exceeds this
+_NAV_MIN_SPEED_SCALE = 0.3      # minimum speed scale when radio is fully visible and close
+
 # Gripper hysteresis filter — prevents flapping by requiring sustained intent
 _GRIPPER_OPEN_VALUE = 1.0       # action value for open gripper
 _GRIPPER_CLOSE_THRESHOLD = 0.0  # below this → model wants to close
@@ -220,6 +226,29 @@ class ModelDrivenPhaseDetector:
                         f"(was navigating: max_base={recent_max_base:.4f})"
                     )
 
+        # ── Grounding visibility gate ──
+        # Block nav→manip transition unless the radio is actually visible
+        # AND close enough (bbox large enough to manipulate).
+        if should_advance and self.current_idx == 0:
+            radio_vis = 0.0
+            radio_size = 0.0
+            if aux_predictions and "grounding_vis" in aux_predictions:
+                radio_vis = float(aux_predictions["grounding_vis"][0])
+            if aux_predictions and "grounding_bbox" in aux_predictions:
+                bbox = aux_predictions["grounding_bbox"]
+                radio_size = max(float(bbox[2]), float(bbox[3]))  # max(w, h)
+            blocked = False
+            if radio_vis < _RADIO_VIS_THRESHOLD:
+                blocked = True
+                reason = f"radio_vis={radio_vis:.0%} < {_RADIO_VIS_THRESHOLD:.0%}"
+            elif radio_size < _RADIO_BBOX_MIN_SIZE:
+                blocked = True
+                reason = f"radio_size={radio_size:.3f} < {_RADIO_BBOX_MIN_SIZE} (too far)"
+            if blocked:
+                should_advance = False
+                if self._total_steps % 50 == 0:
+                    logger.info("  BLOCKED nav→manip: %s", reason)
+
         # ── Execute transition ──
         if should_advance and self.current_idx < len(self.phases) - 1:
             old_idx = self.current_idx
@@ -325,6 +354,22 @@ class B1KPolicyWrapper():
                 TURNING_ON_RADIO_PHASES, total_budget=self.phase_detector.total_budget
             )
 
+    def _grounding_log_dict(self) -> dict:
+        """Extract grounding predictions from last aux output for logging."""
+        aux = self._last_aux_predictions
+        if not aux or "grounding_vis" not in aux:
+            return {}
+        vis = aux["grounding_vis"]
+        bbox = aux["grounding_bbox"]
+        return {
+            "radio_vis": float(vis[0]),
+            "radio_cx": float(bbox[0]), "radio_cy": float(bbox[1]),
+            "radio_w": float(bbox[2]), "radio_h": float(bbox[3]),
+            "table_vis": float(vis[1]),
+            "table_cx": float(bbox[4]), "table_cy": float(bbox[5]),
+            "table_w": float(bbox[6]), "table_h": float(bbox[7]),
+        }
+
     def _inject_phase_metadata(self, batch: dict) -> dict:
         """Inject phase metadata into the batch dict using model's own outputs.
 
@@ -362,11 +407,13 @@ class B1KPolicyWrapper():
                     phase_info["skill_type"],
                     aux_str,
                 )
-            self._phase_history.append({
+            log_entry = {
                 "step": self.step_counter,
                 "warmup": True,
                 **self.phase_detector.get_log_dict(),
-            })
+            }
+            log_entry.update(self._grounding_log_dict())
+            self._phase_history.append(log_entry)
             return batch
 
         # Normal operation: feed both signals to detector, inject phase
@@ -425,11 +472,13 @@ class B1KPolicyWrapper():
                 wrist, proprio_zeroed, act_info, aux_info,
             )
 
-        self._phase_history.append({
+        log_entry = {
             "step": self.step_counter,
             "warmup": False,
             **self.phase_detector.get_log_dict(),
-        })
+        }
+        log_entry.update(self._grounding_log_dict())
+        self._phase_history.append(log_entry)
         return batch
 
     def process_obs(self, obs: dict) -> dict:
@@ -539,6 +588,27 @@ class B1KPolicyWrapper():
                                       -_MAX_BASE_CORRECTION, _MAX_BASE_CORRECTION)
         return action
 
+    def _scale_nav_speed(self, action: np.ndarray) -> np.ndarray:
+        """Slow down base movement when the radio is visible and close.
+
+        Uses radio visibility as a proxy for proximity. Linearly ramps
+        speed from 100% (vis <= _NAV_SLOWDOWN_VIS) to _NAV_MIN_SPEED_SCALE
+        (vis = 1.0). Only active during navigation phase.
+        """
+        if self.phase_detector is None or not self.phase_detector.is_navigation:
+            return action
+        aux = self._last_aux_predictions
+        if not aux or "grounding_vis" not in aux:
+            return action
+        radio_vis = float(aux["grounding_vis"][0])
+        if radio_vis <= _NAV_SLOWDOWN_VIS:
+            return action
+        t = (radio_vis - _NAV_SLOWDOWN_VIS) / (1.0 - _NAV_SLOWDOWN_VIS)
+        scale = 1.0 - t * (1.0 - _NAV_MIN_SPEED_SCALE)
+        action = np.array(action, copy=True)
+        action[..., :3] *= scale
+        return action
+
     def _store_predicted_actions(self, action_dict: dict, obs_batch: dict | None = None):
         """Store the model's raw predicted actions AND run aux heads for phase detection.
 
@@ -580,9 +650,20 @@ class B1KPolicyWrapper():
                     if self.step_counter % self._log_interval == 0:
                         phase_idx = int(aux_preds.get("phase_index", -1))
                         skill_type = int(aux_preds.get("skill_type", -1))
+                        grounding_str = ""
+                        if "grounding_vis" in aux_preds and "grounding_bbox" in aux_preds:
+                            vis = aux_preds["grounding_vis"]
+                            bbox = aux_preds["grounding_bbox"]
+                            obj_names = ["radio", "table"]
+                            parts = []
+                            for i, name in enumerate(obj_names):
+                                v = float(vis[i])
+                                cx, cy = float(bbox[i * 4]), float(bbox[i * 4 + 1])
+                                parts.append(f"{name}={v:.0%}@({cx:.2f},{cy:.2f})")
+                            grounding_str = " | " + " ".join(parts)
                         logger.info(
-                            "[Step %4d] Aux head (phase-blind prompt): phase_index=%d skill_type=%d",
-                            self.step_counter, phase_idx, skill_type,
+                            "[Step %4d] Aux head: phase=%d skill=%d%s",
+                            self.step_counter, phase_idx, skill_type, grounding_str,
                         )
             except Exception as e:
                 logger.debug("Aux head predict_phase failed (non-fatal): %s", e)
@@ -652,6 +733,7 @@ class B1KPolicyWrapper():
         final_action = final_action[None]
 
         final_action = self._clamp_base_if_manipulating(final_action)
+        final_action = self._scale_nav_speed(final_action)
         final_action = self._filter_grippers(final_action)
 
         self.step_counter += 1
@@ -681,6 +763,7 @@ class B1KPolicyWrapper():
                 # pop the first action in the queue
                 final_action = self.action_queue.popleft()[None]
                 final_action = self._clamp_base_if_manipulating(final_action)
+                final_action = self._scale_nav_speed(final_action)
                 final_action = self._filter_grippers(final_action)
                 return torch.from_numpy(final_action)
         
@@ -734,6 +817,7 @@ class B1KPolicyWrapper():
             final_action = target_joint_positions
 
         final_action = self._clamp_base_if_manipulating(final_action)
+        final_action = self._scale_nav_speed(final_action)
         final_action = self._filter_grippers(final_action)
 
         self.step_counter += 1
